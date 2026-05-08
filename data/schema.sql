@@ -140,3 +140,26 @@ INSERT INTO interactions (id, session_id, lead_id, campaign_id, customer_id, age
         '{"transcript": [{"role": "agent", "content": "Hello—"}, {"role": "customer", "content": "Wrong number"}]}',
         '{"analysis_status": "pending"}'
     );
+
+
+-- 1. Durability: Track pipeline state independently from call state
+ALTER TABLE interactions 
+ADD COLUMN processing_status VARCHAR(50) DEFAULT 'INITIATED',
+ADD COLUMN priority_lane VARCHAR(20) DEFAULT 'unassigned',
+ADD COLUMN recording_status VARCHAR(20) DEFAULT 'pending',
+ADD COLUMN tokens_consumed INTEGER DEFAULT 0;
+
+CREATE INDEX idx_interactions_processing_status ON interactions(processing_status);
+
+-- 2. Budgeting: Per-Customer Token Budget Enforcement (AC2)
+CREATE TABLE customer_budgets (
+    customer_id UUID PRIMARY KEY,
+    tokens_per_minute_limit INTEGER NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Seed mock budgets for testing
+INSERT INTO customer_budgets (customer_id, tokens_per_minute_limit) VALUES
+    ('d0000000-0000-0000-0000-000000000001', 20000), 
+    ('d0000000-0000-0000-0000-000000000002', 30000);
