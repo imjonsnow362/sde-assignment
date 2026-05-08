@@ -37,58 +37,26 @@ from src.config import settings
 
 logger = logging.getLogger(__name__)
 
+class RecordingNotReadyException(Exception):
+    pass
 
-async def fetch_and_upload_recording(
-    interaction_id: str,
-    call_sid: str,
-    exotel_account_id: str,
-) -> Optional[str]:
-    """
-    Attempt to fetch the Exotel recording and upload it to S3.
-
-    Current implementation: sleep 45s, try once, return None on failure.
-    Failure is logged at DEBUG level — effectively invisible in production
-    where the log level is INFO.
-
-    Returns the S3 key on success, None on failure or timeout.
-    """
-
-    # This sleep blocks the entire Celery task. While we're sleeping here,
-    # the LLM quota is sitting idle, the analysis hasn't started, and the
-    # dashboard still shows "processing" for what might be a confirmed rebook
-    # that the sales team is waiting to act on.
-    await asyncio.sleep(settings.RECORDING_WAIT_SECONDS)
-
+async def fetch_and_upload_recording(interaction_id: str, call_sid: str, exotel_account_id: str) -> str:
+    """Attempt to fetch recording. Raises RecordingNotReadyException if 404."""
     try:
         recording_url = await _fetch_exotel_recording_url(call_sid, exotel_account_id)
 
         if not recording_url:
-            # Not available after 45s. We move on. No record that we tried.
-            # An ops engineer investigating "why is there no recording for
-            # interaction X?" has no log entry to find.
-            logger.debug(
-                "recording_not_available",
-                extra={
-                    "interaction_id": interaction_id,
-                    "call_sid": call_sid,
-                    "waited_seconds": settings.RECORDING_WAIT_SECONDS,
-                },
-            )
-            return None
+            logger.info("recording_not_ready", extra={"interaction_id": interaction_id, "call_sid": call_sid})
+            raise RecordingNotReadyException("URL not yet available.")
 
         s3_key = await _upload_to_s3(recording_url, interaction_id)
         return s3_key
 
+    except RecordingNotReadyException:
+        raise
     except Exception as e:
-        # Exception is caught here and swallowed. The caller (Celery task)
-        # doesn't know whether this succeeded, failed, or was skipped.
-        # It logs at ERROR level, which is at least visible — but there's
-        # no retry path and no way to replay just the recording upload later.
-        logger.exception(
-            "recording_upload_error",
-            extra={"interaction_id": interaction_id, "error": str(e)},
-        )
-        return None
+        logger.error("recording_upload_error", extra={"interaction_id": interaction_id, "error": str(e)})
+        raise
 
 
 async def _fetch_exotel_recording_url(
