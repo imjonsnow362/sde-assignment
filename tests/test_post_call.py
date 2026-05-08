@@ -1,114 +1,94 @@
-"""
-Tests for the current post-call processing system.
-
-These tests document the EXISTING behaviour — including its problems.
-Your solution should make these tests obsolete and replace them with
-tests that validate the new architecture.
-"""
-
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
-from datetime import datetime
+from src.services.rate_limiter import TokenBucketRateLimiter
+from src.services.recording import fetch_and_upload_recording, RecordingNotReadyException
+from src.tasks.celery_tasks import triage_interaction_task
 
-from src.services.post_call_processor import PostCallProcessor, PostCallContext
+@pytest.mark.asyncio
+async def test_ac8_short_transcript_skips_llm():
+    """
+    AC8: Short transcripts (< 4 turns / 15 words) never consume LLM quota.
+    """
+    payload = {
+        "interaction_id": "test-short-001",
+        "lead_id": "lead-123",
+        "transcript_text": "agent: hello \n customer: wrong number",
+    }
+    
+    with patch("src.tasks.celery_tasks._run_async") as mock_run_async, \
+         patch("src.tasks.celery_tasks.fetch_recording_task.apply_async") as mock_recording, \
+         patch("src.tasks.celery_tasks.process_llm_task.apply_async") as mock_llm:
+        
+        triage_interaction_task(payload)
+        
+        # Ensure recording fetch was still triggered concurrently
+        mock_recording.assert_called_once()
+        
+        # CRITICAL: Ensure LLM task was NEVER called because transcript was short
+        mock_llm.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_every_call_gets_full_llm_analysis(make_post_call_context):
+async def test_ac1_ac2_rate_limiter_enforces_budgets():
     """
-    CURRENT BEHAVIOUR: Even a clear "not interested" call gets full LLM analysis.
-    This is the core inefficiency — there is no triage step.
+    AC1 & AC2: System respects rate limits and enforces per-customer budgets.
     """
-    ctx = make_post_call_context("not_interested")
-    processor = PostCallProcessor()
-
-    with patch.object(processor, "_call_llm", new_callable=AsyncMock) as mock_llm:
-        mock_llm.return_value = {
-            "call_stage": "not_interested",
-            "entities": {},
-            "summary": "Customer not interested",
-            "usage": {"total_tokens": 1200},
-        }
-
-        with patch.object(processor, "_update_interaction_metadata", new_callable=AsyncMock):
-            result = await processor.process_post_call(ctx)
-
-        # LLM was called — even though the transcript clearly says "not interested"
-        mock_llm.assert_called_once()
-        assert result.tokens_used == 1200
+    limiter = TokenBucketRateLimiter()
+    customer_a = "cust-A"
+    customer_b = "cust-B"
+    
+    # Mock the Redis Lua script evaluation
+    with patch("src.services.rate_limiter.redis_client.eval", new_callable=AsyncMock) as mock_eval:
+        
+        # Scenario 1: Customer A has tokens. Should return True (1).
+        mock_eval.return_value = 1
+        result = await limiter.consume_tokens(customer_a, 1500, 20000)
+        assert result is True
+        
+        # Scenario 2: Customer A exhausts their budget. Redis Lua returns 0.
+        mock_eval.return_value = 0
+        result = await limiter.consume_tokens(customer_a, 1500, 20000)
+        assert result is False
+        
+        # Scenario 3: Customer A is exhausted, but Customer B still has budget.
+        # We simulate Customer B's request succeeding.
+        mock_eval.return_value = 1
+        result = await limiter.consume_tokens(customer_b, 1500, 30000)
+        assert result is True
 
 
 @pytest.mark.asyncio
-async def test_rebook_gets_same_priority_as_not_interested(make_post_call_context):
+async def test_ac4_recording_poller_raises_exception_for_backoff():
     """
-    CURRENT BEHAVIOUR: A high-value rebook confirmation has zero priority
-    over a "not interested" call. Both sit in the same Celery queue.
+    AC4: Recording poller does not sleep blindly. If 404, it raises an exception
+    so Celery can trigger exponential backoff.
     """
-    rebook_ctx = make_post_call_context("rebook_confirmed")
-    not_interested_ctx = make_post_call_context("not_interested")
-
-    # Both would be enqueued to the same "postcall_processing" queue
-    # with no priority differentiation
-    assert True  # Documenting the absence of prioritisation
+    interaction_id = "test-rec-001"
+    
+    with patch("src.services.recording._fetch_exotel_recording_url", new_callable=AsyncMock) as mock_fetch:
+        # Simulate Exotel returning 404 (Not Ready)
+        mock_fetch.return_value = None
+        
+        # The function MUST raise RecordingNotReadyException instead of sleeping
+        with pytest.raises(RecordingNotReadyException):
+            await fetch_and_upload_recording(interaction_id, "sid-123", "account-123")
 
 
 @pytest.mark.asyncio
-async def test_short_transcript_detected():
+async def test_ac4_recording_poller_succeeds():
     """
-    CURRENT BEHAVIOUR: Short transcripts ARE detected, but only at the
-    FastAPI endpoint level. If the detection fails or the logic changes,
-    short calls still enter the Celery queue.
+    Verify that when the recording IS available, it processes instantly.
     """
-    ctx = PostCallContext(
-        interaction_id="test-001",
-        session_id="test-session",
-        lead_id="test-lead",
-        campaign_id="test-campaign",
-        customer_id="test-customer",
-        agent_id="test-agent",
-        call_sid="test-call",
-        transcript_text="agent: Hello\ncustomer: Wrong number",
-        conversation_data={"transcript": [
-            {"role": "agent", "content": "Hello"},
-            {"role": "customer", "content": "Wrong number"},
-        ]},
-        additional_data={},
-        ended_at=datetime.utcnow(),
-    )
-
-    # Short transcript detection exists but is fragile
-    transcript = ctx.conversation_data.get("transcript", [])
-    is_short = len(transcript) < 4
-    assert is_short is True
-
-
-@pytest.mark.asyncio
-async def test_recording_blocks_processing(make_post_call_context):
-    """
-    CURRENT BEHAVIOUR: Recording upload blocks for 45 seconds before
-    LLM analysis can start, even if the recording is available immediately
-    or won't be available at all.
-    """
-    # The asyncio.sleep(45) in recording.py means every call waits 45s
-    # before any LLM analysis begins, regardless of recording availability.
-    # This test documents the coupling — recording should not block analysis.
-    assert True  # Documenting the 45s blocking sleep
-
-
-@pytest.mark.asyncio
-async def test_circuit_breaker_freezes_dialler():
-    """
-    CURRENT BEHAVIOUR: When post-call LLM usage >= 90%, the circuit breaker
-    freezes ALL outbound dialling for the agent for 1800 seconds.
-    No gradual backpressure, no per-campaign granularity.
-    """
-    from src.services.circuit_breaker import PostCallCircuitBreaker
-
-    breaker = PostCallCircuitBreaker()
-    breaker._capacity_threshold = 0.90
-    breaker._freeze_seconds = 1800
-
-    # If we could mock Redis to return RPM at 91% of max,
-    # the breaker would trip and freeze ALL calls for that agent
-    assert breaker._freeze_seconds == 1800
-    assert breaker._capacity_threshold == 0.90
+    interaction_id = "test-rec-002"
+    
+    with patch("src.services.recording._fetch_exotel_recording_url", new_callable=AsyncMock) as mock_fetch, \
+         patch("src.services.recording._upload_to_s3", new_callable=AsyncMock) as mock_upload:
+        
+        # Simulate Exotel returning the URL successfully
+        mock_fetch.return_value = "https://exotel.com/recording.mp3"
+        mock_upload.return_value = "recordings/test-rec-002.mp3"
+        
+        result = await fetch_and_upload_recording(interaction_id, "sid-123", "account-123")
+        
+        assert result == "recordings/test-rec-002.mp3"
+        mock_upload.assert_called_once()
