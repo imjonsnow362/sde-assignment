@@ -37,6 +37,7 @@ from pydantic import BaseModel
 
 from src.services.signal_jobs import trigger_signal_jobs, update_lead_stage
 from src.tasks.celery_tasks import process_interaction_end_background_task
+from src.tasks.celery_tasks import triage_interaction_task
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -58,145 +59,40 @@ class InteractionEndResponse(BaseModel):
     message: str
 
 
-@router.post(
-    "/session/{session_id}/interaction/{interaction_id}/end",
-    response_model=InteractionEndResponse,
-)
-async def end_interaction(
-    session_id: UUID,
-    interaction_id: UUID,
-    request: InteractionEndRequest,
-    background_tasks: BackgroundTasks,
-):
-    """
-    End an interaction and trigger post-call processing.
-
-    Current flow:
-    1. Load interaction from DB
-    2. Mark status ENDED
-    3. Decide short vs long transcript
-       - Short (< 4 turns): fire signal jobs inline, skip LLM
-       - Long: dump everything into Celery, fire signal jobs anyway (empty payload)
-    4. Return 200 before anything actually processes
-    """
+@router.post("/session/{session_id}/interaction/{interaction_id}/end", response_model=InteractionEndResponse)
+async def end_interaction(session_id: UUID, interaction_id: UUID, request: InteractionEndRequest):
     try:
         interaction = await _load_interaction(interaction_id)
-
         if not interaction:
-            raise HTTPException(status_code=404, detail="Interaction not found")
+            raise HTTPException(status_code=404, detail="Not found")
 
         await _update_interaction_status(
-            interaction_id=str(interaction_id),
-            status="ENDED",
-            ended_at=datetime.utcnow(),
-            duration=request.duration_seconds,
-            call_sid=request.call_sid,
+            interaction_id=str(interaction_id), status="ENDED",
+            ended_at=datetime.utcnow(), duration=request.duration_seconds, call_sid=request.call_sid,
         )
 
         transcript = interaction.get("conversation_data", {}).get("transcript", [])
-        is_short = len(transcript) < 4
+        transcript_text = "\n".join(f"{t.get('role', '')}: {t.get('content', '')}" for t in transcript)
 
-        if is_short:
-            # Fewer than 4 turns: wrong number, immediate hangup, network drop.
-            # Skip LLM — there's nothing meaningful to extract.
-            # Signal jobs still fire so the lead stage gets updated.
-            logger.info(
-                "short_transcript_fast_path",
-                extra={"interaction_id": str(interaction_id)},
-            )
+        celery_payload = {
+            "interaction_id": str(interaction_id),
+            "session_id": str(session_id),
+            "lead_id": str(interaction["lead_id"]),
+            "campaign_id": str(interaction["campaign_id"]),
+            "customer_id": str(interaction["customer_id"]),
+            "transcript_text": transcript_text,
+            "call_sid": request.call_sid,
+            "exotel_account_id": interaction.get("exotel_account_id"),
+        }
 
-            # These asyncio.create_tasks share the FastAPI event loop.
-            # If the server restarts between the 200 response and these
-            # completing, they vanish with no trace. No retry, no record.
-            asyncio.create_task(
-                trigger_signal_jobs(
-                    interaction_id=str(interaction_id),
-                    session_id=str(session_id),
-                    campaign_id=interaction["campaign_id"],
-                    analysis_result={"call_stage": "short_call"},
-                )
-            )
-            asyncio.create_task(
-                update_lead_stage(
-                    lead_id=interaction["lead_id"],
-                    interaction_id=str(interaction_id),
-                    call_stage="short_call",
-                )
-            )
+        # Fire ONLY the triage task. No fire-and-forget asyncio tasks.
+        triage_interaction_task.apply_async(args=[celery_payload], queue="postcall_processing")
 
-        else:
-            # Long transcript: pack everything into a Celery payload and enqueue.
-            # All calls get the same queue, same priority, same processing path —
-            # regardless of whether the call resulted in a confirmed booking or
-            # a customer hanging up after one sentence.
-            transcript_text = "\n".join(
-                f"{turn.get('role', 'unknown')}: {turn.get('content', '')}"
-                for turn in transcript
-            )
+        logger.info("postcall_triage_enqueued", extra={"interaction_id": str(interaction_id)})
+        return InteractionEndResponse(status="ok", interaction_id=str(interaction_id), message="Triage enqueued")
 
-            celery_payload = {
-                "interaction_id": str(interaction_id),
-                "session_id": str(session_id),
-                "lead_id": interaction["lead_id"],
-                "campaign_id": interaction["campaign_id"],
-                "customer_id": interaction["customer_id"],
-                "agent_id": interaction["agent_id"],
-                "call_sid": request.call_sid,
-                "transcript_text": transcript_text,
-                "conversation_data": interaction.get("conversation_data", {}),
-                "additional_data": request.additional_data or {},
-                "ended_at": datetime.utcnow().isoformat(),
-                "exotel_account_id": interaction.get("exotel_account_id"),
-            }
-
-            task = process_interaction_end_background_task.apply_async(
-                args=[celery_payload],
-                queue="postcall_processing",  # One queue to rule them all
-            )
-
-            logger.info(
-                "postcall_enqueued",
-                extra={
-                    "interaction_id": str(interaction_id),
-                    "celery_task_id": task.id,
-                    # Notice what's NOT logged here: no queue depth, no estimated
-                    # wait time, no indication of how backed up we are.
-                },
-            )
-
-            # These fire immediately — before Celery has done anything.
-            # analysis_result={} means downstream gets an empty analysis.
-            # This was supposed to be a "best effort early trigger" but it
-            # mostly just sends empty payloads to signal_jobs.
-            asyncio.create_task(
-                trigger_signal_jobs(
-                    interaction_id=str(interaction_id),
-                    session_id=str(session_id),
-                    campaign_id=interaction["campaign_id"],
-                    analysis_result={},  # ← Celery hasn't run yet. This is empty.
-                )
-            )
-            asyncio.create_task(
-                update_lead_stage(
-                    lead_id=interaction["lead_id"],
-                    interaction_id=str(interaction_id),
-                    call_stage="processing",  # ← Placeholder, not a real outcome
-                )
-            )
-
-        return InteractionEndResponse(
-            status="ok",
-            interaction_id=str(interaction_id),
-            message="Interaction ended, processing enqueued",
-        )
-
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.exception(
-            "end_interaction_failed",
-            extra={"interaction_id": str(interaction_id), "error": str(e)},
-        )
+        logger.exception("end_interaction_failed", extra={"interaction_id": str(interaction_id)})
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
