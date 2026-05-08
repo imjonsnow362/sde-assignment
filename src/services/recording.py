@@ -34,10 +34,12 @@ from typing import Optional
 import httpx
 
 from src.config import settings
+from src.utils.logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 class RecordingNotReadyException(Exception):
+    """Raised when Exotel returns a 404 for the recording URL."""
     pass
 
 async def fetch_and_upload_recording(interaction_id: str, call_sid: str, exotel_account_id: str) -> str:
