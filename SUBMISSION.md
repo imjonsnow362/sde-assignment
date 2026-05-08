@@ -577,3 +577,10 @@ Build operational tooling for:
 - failed task inspection
 - replay workflows
 - manual recovery
+
+
+## 15. What I Would Do With More Time
+
+1. **Gradual Dialer Backpressure (Feedback Loop):** I left out an active feedback loop to the dialer. Ideally, I would implement a mechanism that monitors the `llm_hot` queue depth; if the queue exceeds 5,000 tasks, it would signal the dialer to gracefully reduce its outbound call rate by 20% until the queue drains, creating a smooth throttle rather than a hard freeze.
+2. **Inbound Webhook Idempotency:** Telephony providers (Exotel) sometimes retry webhooks if network latency is high. If Exotel sends the same call-end event twice, our system might enqueue two identical processing tasks. I left out a Redis-based idempotency key (using `call_sid` with a 24-hour TTL) which would immediately return a 200 OK for duplicate webhooks, preventing duplicate token spend.
+3. **Dead Letter Queue (DLQ):** I focused heavily on the core LLM rate-limiting, but left the downstream CRM push (`signal_jobs.py`) as a mock. Because external CRM APIs frequently rate-limit or timeout, I would eventually build a dedicated Celery task for CRM syncing with its own exponential backoff, plus a Dead Letter Queue (DLQ) dashboard for operations to manually replay permanently failed webhook syncs.
